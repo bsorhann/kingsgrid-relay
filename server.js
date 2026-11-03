@@ -17,14 +17,34 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
+// KOPMA TOLERANSI: eşleşmiş iki oyuncudan biri (ağ kesintisi, Wi-Fi atlaması vb.)
+// düşerse, eşleşme HEMEN yıkılmaz; GRACE_MS boyunca bekletilir. Düşen oyuncu
+// eşleşmede aldığı "token" ile geri bağlanırsa ("resume") maç kaldığı yerden
+// devam eder. Süre dolarsa kalan oyuncuya "peer_disconnected" gider (o kazanır).
+// Oyuncu maçtan KASTEN ayrılırsa ("cancel") bekleme yoktur, hemen bildirilir.
+const GRACE_MS = parseInt(process.env.GRACE_MS || '20000', 10);
+const HEARTBEAT_MS = 10 * 1000;   // sessizce ölen bağlantıları (half-open) yakalar
+
 // rooms: kod -> { host: ws, guest: ws|null }
 const rooms = new Map();
+// pairs: pairId -> { sides:[ws,ws], tokens:[t,t], roles:['host','guest'], lost:[bool,bool], timer }
+const pairs = new Map();
+const tokenToPair = new Map();
 // randomQueue: rastgele eşleşme bekleyen bağlantılar (FIFO).
 let randomQueue = [];
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // karışabilecek 0/O, 1/I çıkarıldı
 const CODE_LENGTH = 5;
 const ROOM_TIMEOUT_MS = 10 * 60 * 1000; // misafir gelmezse 10 dakika sonra oda otomatik silinir
+
+function generateToken() {
+	let t;
+	do {
+		t = '';
+		for (let i = 0; i < 20; i++) t += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+	} while (tokenToPair.has(t));
+	return t;
+}
 
 function generateCode() {
 	let code;
@@ -43,12 +63,58 @@ function send(ws, obj) {
 	}
 }
 
-function cleanupConnection(ws) {
+function endPair(pair, notifyConnected) {
+	if (pair.timer) clearTimeout(pair.timer);
+	pair.timer = null;
+	for (let i = 0; i < 2; i++) {
+		const w = pair.sides[i];
+		if (notifyConnected && w && !pair.lost[i]) {
+			send(w, { type: 'peer_disconnected' });
+		}
+		if (w && w.pairObj === pair) {
+			w.pairObj = null;
+			w.peer = null;
+		}
+		tokenToPair.delete(pair.tokens[i]);
+	}
+	pairs.delete(pair.id);
+}
+
+function markLost(ws) {
+	const pair = ws.pairObj;
+	if (!pair) return;
+	const i = pair.sides.indexOf(ws);
+	if (i < 0 || pair.lost[i]) return;
+	pair.lost[i] = true;
+	ws.peer = null;
+	const other = pair.sides[1 - i];
+	if (other && !pair.lost[1 - i]) {
+		other.peer = null;
+		send(other, { type: 'peer_lost', grace: Math.round(GRACE_MS / 1000) });
+	}
+	if (!pair.timer) {
+		pair.timer = setTimeout(() => endPair(pair, true), GRACE_MS);
+	}
+}
+
+// voluntary=true: oyuncu kasıtlı ayrıldı (bekleme yok). false: soket düştü (bekleme var).
+function cleanupConnection(ws, voluntary) {
 	randomQueue = randomQueue.filter((w) => w !== ws);
 	if (ws.roomCode && rooms.has(ws.roomCode)) {
 		const room = rooms.get(ws.roomCode);
 		if (room.timeoutHandle) clearTimeout(room.timeoutHandle);
 		rooms.delete(ws.roomCode);
+	}
+	const pair = ws.pairObj;
+	if (pair) {
+		if (voluntary || GRACE_MS <= 0) {
+			const i = pair.sides.indexOf(ws);
+			if (i >= 0) pair.lost[i] = true;   // ayrılan taraf bildirim ALMAZ
+			endPair(pair, true);
+		} else {
+			markLost(ws);
+		}
+		return;
 	}
 	if (ws.peer) {
 		send(ws.peer, { type: 'peer_disconnected' });
@@ -57,19 +123,66 @@ function cleanupConnection(ws) {
 }
 
 function pair(peerA, peerB, roleAIsHost) {
-	peerA.peer = peerB;
-	peerB.peer = peerA;
 	if (peerA.roomCode && rooms.has(peerA.roomCode)) {
 		const room = rooms.get(peerA.roomCode);
 		if (room.timeoutHandle) clearTimeout(room.timeoutHandle);
 	}
-	send(peerA, { type: 'paired', role: roleAIsHost ? 'host' : 'guest' });
-	send(peerB, { type: 'paired', role: roleAIsHost ? 'guest' : 'host' });
+	const p = {
+		id: generateToken(),
+		sides: [peerA, peerB],
+		tokens: [generateToken(), null],
+		roles: [roleAIsHost ? 'host' : 'guest', roleAIsHost ? 'guest' : 'host'],
+		lost: [false, false],
+		timer: null,
+	};
+	p.tokens[1] = generateToken();
+	pairs.set(p.id, p);
+	tokenToPair.set(p.tokens[0], p);
+	tokenToPair.set(p.tokens[1], p);
+	peerA.pairObj = p;
+	peerB.pairObj = p;
+	peerA.peer = peerB;
+	peerB.peer = peerA;
+	const grace = Math.round(GRACE_MS / 1000);
+	send(peerA, { type: 'paired', role: p.roles[0], token: p.tokens[0], grace });
+	send(peerB, { type: 'paired', role: p.roles[1], token: p.tokens[1], grace });
+}
+
+function resume(ws, token) {
+	const pair = tokenToPair.get(String(token || ''));
+	if (!pair) {
+		send(ws, { type: 'resume_failed' });
+		return;
+	}
+	const i = pair.tokens.indexOf(token);
+	// Eski soket hâlâ "açık" görünüyorsa (yarım kalmış bağlantı) önce onu düşür.
+	const old = pair.sides[i];
+	if (old && old !== ws) {
+		if (!pair.lost[i]) markLost(old);
+		old.pairObj = null;
+		old.peer = null;
+		try { old.terminate(); } catch (e) { /* yok say */ }
+	}
+	pair.sides[i] = ws;
+	pair.lost[i] = false;
+	ws.pairObj = pair;
+	const other = pair.sides[1 - i];
+	const otherOnline = !!other && !pair.lost[1 - i];
+	if (otherOnline) {
+		ws.peer = other;
+		other.peer = ws;
+		if (pair.timer) { clearTimeout(pair.timer); pair.timer = null; }
+	}
+	send(ws, { type: 'resumed', role: pair.roles[i], peer_online: otherOnline });
+	if (otherOnline) send(other, { type: 'peer_resumed' });
 }
 
 wss.on('connection', (ws) => {
 	ws.peer = null;
 	ws.roomCode = null;
+	ws.pairObj = null;
+	ws.isAlive = true;
+	ws.on('pong', () => { ws.isAlive = true; });
 
 	ws.on('message', (raw) => {
 		let msg;
@@ -119,9 +232,13 @@ wss.on('connection', (ws) => {
 				break;
 			}
 			case 'cancel': {
-				cleanupConnection(ws);
+				cleanupConnection(ws, true);
 				ws.roomCode = null;
 				ws.peer = null;
+				break;
+			}
+			case 'resume': {
+				resume(ws, msg.token);
 				break;
 			}
 			case 'relay': {
@@ -136,12 +253,24 @@ wss.on('connection', (ws) => {
 	});
 
 	ws.on('close', () => {
-		cleanupConnection(ws);
+		cleanupConnection(ws, false);
 	});
 
 	ws.on('error', () => {
-		cleanupConnection(ws);
+		cleanupConnection(ws, false);
 	});
 });
+
+// Kalp atışı: yanıt vermeyen soketi kapat → "close" → bekleme süresi başlar.
+setInterval(() => {
+	wss.clients.forEach((ws) => {
+		if (ws.isAlive === false) {
+			ws.terminate();
+			return;
+		}
+		ws.isAlive = false;
+		try { ws.ping(); } catch (e) { /* yok say */ }
+	});
+}, HEARTBEAT_MS);
 
 console.log(`Kingsgrid relay sunucusu ${PORT} portunda çalışıyor.`);
