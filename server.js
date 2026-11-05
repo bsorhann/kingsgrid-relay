@@ -194,6 +194,14 @@ wss.on('connection', (ws) => {
 
 		switch (msg.type) {
 			case 'create_room': {
+				if (ws.pairObj || ws.peer) break;
+				if (ws.roomCode && rooms.has(ws.roomCode)) {
+					const prev = rooms.get(ws.roomCode);
+					if (prev.host === ws && !prev.guest) {
+						if (prev.timeoutHandle) clearTimeout(prev.timeoutHandle);
+						rooms.delete(ws.roomCode);
+					}
+				}
 				const code = generateCode();
 				const timeoutHandle = setTimeout(() => {
 					if (rooms.has(code) && !rooms.get(code).guest) {
@@ -209,7 +217,7 @@ wss.on('connection', (ws) => {
 			case 'join_room': {
 				const code = String(msg.code || '').toUpperCase();
 				const room = rooms.get(code);
-				if (!room || !room.host || room.guest) {
+				if (!room || !room.host || room.guest || room.host === ws) {
 					send(ws, { type: 'error', message: 'Oda bulunamadı ya da zaten dolu.' });
 					return;
 				}
@@ -219,10 +227,18 @@ wss.on('connection', (ws) => {
 				break;
 			}
 			case 'random_match': {
+				// Zaten eşleşmiş ya da bir ortağı olan bağlantı tekrar kuyruğa girmez.
+				if (ws.pairObj || ws.peer) break;
+				// Düğmeye art arda basılırsa aynı bağlantı kuyruğa ikinci kez girmesin
+				// (aksi halde kendiyle eşleşirdi): sadece "bekleniyor" bilgisini tekrarla.
+				if (randomQueue.includes(ws)) {
+					send(ws, { type: 'waiting' });
+					break;
+				}
 				// Kuyrukta artık geçerli (hâlâ açık) biri var mı diye ara.
 				while (randomQueue.length > 0) {
 					const otherWs = randomQueue.shift();
-					if (otherWs.readyState === WebSocket.OPEN) {
+					if (otherWs !== ws && otherWs.readyState === WebSocket.OPEN) {
 						pair(otherWs, ws, true); // kuyrukta önce bekleyen "host" sayılır
 						return;
 					}
